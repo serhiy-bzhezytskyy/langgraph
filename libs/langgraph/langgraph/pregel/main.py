@@ -108,6 +108,7 @@ from langgraph.callbacks import (
     get_sync_graph_callback_manager_for_config,
 )
 from langgraph.channels.base import BaseChannel
+from langgraph.channels.named_barrier_value import InclusiveNamedBarrierValue
 from langgraph.channels.topic import Topic
 from langgraph.config import get_config
 from langgraph.constants import END
@@ -445,6 +446,24 @@ def _normalize_stream_transformer_factories(
 
         factories.append(factory)
     return factories
+
+
+def _next_with_inclusive(
+    next_names: tuple[str, ...], channels: dict[str, BaseChannel]
+) -> tuple[str, ...]:
+    """Report the target of an inclusive waiting edge holding writes as next when
+    nothing else is scheduled, so a run paused at the release point does not
+    read as a finished one (empty next is the end-of-run signal)."""
+    if next_names:
+        return next_names
+    return tuple(
+        name.rsplit(":", 1)[1]
+        for name, channel in channels.items()
+        if isinstance(channel, InclusiveNamedBarrierValue)
+        and not channel.released
+        and channel.seen
+        and channel.seen != channel.names
+    )
 
 
 class Pregel(
@@ -1256,7 +1275,9 @@ class Pregel(
         # assemble the state snapshot
         return StateSnapshot(
             read_channels(channels, self.stream_channels_asis),
-            tuple(t.name for t in next_tasks.values() if not t.writes),
+            _next_with_inclusive(
+                tuple(t.name for t in next_tasks.values() if not t.writes), channels
+            ),
             patch_checkpoint_map(saved.config, saved.metadata),
             saved.metadata,
             saved.checkpoint["ts"],
@@ -1380,7 +1401,9 @@ class Pregel(
         # assemble the state snapshot
         return StateSnapshot(
             read_channels(channels, self.stream_channels_asis),
-            tuple(t.name for t in next_tasks.values() if not t.writes),
+            _next_with_inclusive(
+                tuple(t.name for t in next_tasks.values() if not t.writes), channels
+            ),
             patch_checkpoint_map(saved.config, saved.metadata),
             saved.metadata,
             saved.checkpoint["ts"],

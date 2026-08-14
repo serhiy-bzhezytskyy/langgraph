@@ -848,6 +848,37 @@ class Command(Generic[N], ToolOutputMixin):
     PARENT: ClassVar[Literal["__parent__"]] = "__parent__"
 
 
+class WaitingEdgeRelease(NamedTuple):
+    """How an inclusive waiting edge released: the nodes that arrived and the
+    ones that never ran."""
+
+    target: str
+    arrived: set[str]
+    missing: set[str]
+
+
+def waiting_edge_release() -> WaitingEdgeRelease | None:
+    """Call inside a node to learn how the node came to run, when its trigger
+    is an inclusive waiting edge: `add_edge([...], end_key, inclusive=True)`.
+
+    Returns:
+        The edge's target with the listed nodes that arrived and the ones that
+        never ran, when the edge released with only some of its nodes. None
+        when every listed node ran, or when the node was not triggered by an
+        inclusive waiting edge — so a partial release is distinguishable from
+        a full one at the moment the target runs.
+    """
+    from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD
+    from langgraph.config import get_config
+
+    conf = get_config()["configurable"]
+    scratchpad = conf.get(CONFIG_KEY_SCRATCHPAD)
+    release = getattr(scratchpad, "waiting_edge_release", None)
+    if release is None:
+        return None
+    return WaitingEdgeRelease(release["target"], release["arrived"], release["missing"])
+
+
 def interrupt(value: Any) -> Any:
     """Interrupt the graph with a resumable exception from within a node.
 

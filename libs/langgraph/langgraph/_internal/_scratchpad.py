@@ -17,3 +17,5 @@ class PregelScratchpad:
     resume: list[Any]
     # subgraph
     subgraph_counter: Callable[[], int]
+    # inclusive waiting edge release: {"target", "arrived", "missing"}
+    waiting_edge_release: Any = None

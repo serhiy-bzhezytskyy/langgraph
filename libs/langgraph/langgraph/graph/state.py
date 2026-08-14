@@ -54,6 +54,7 @@ from langgraph.channels.delta import DeltaChannel
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.channels.last_value import LastValue, LastValueAfterFinish
 from langgraph.channels.named_barrier_value import (
+    InclusiveNamedBarrierValue,
     NamedBarrierValue,
     NamedBarrierValueAfterFinish,
 )
@@ -206,6 +207,7 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
     managed: dict[str, ManagedValueSpec]
     schemas: dict[type[Any], dict[str, BaseChannel | ManagedValueSpec]]
     waiting_edges: set[tuple[tuple[str, ...], str]]
+    inclusive_edges: set[tuple[tuple[str, ...], str]]
 
     compiled: bool
     state_schema: type[StateT]
@@ -257,6 +259,7 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
         self.managed = {}
         self.compiled = False
         self.waiting_edges = set()
+        self.inclusive_edges = set()
 
         self.state_schema = state_schema
         self.input_schema = cast(type[InputT], input_schema or state_schema)
@@ -925,7 +928,9 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
 
         return self
 
-    def add_edge(self, start_key: str | list[str], end_key: str) -> Self:
+    def add_edge(
+        self, start_key: str | list[str], end_key: str, *, inclusive: bool = False
+    ) -> Self:
         """Add a directed edge from the start node (or list of start nodes) to the end node.
 
         When a single start node is provided, the graph will wait for that node to complete
@@ -935,6 +940,10 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
         Args:
             start_key: The key(s) of the start node(s) of the edge.
             end_key: The key of the end node of the edge.
+            inclusive: When True (list form only), the edge also releases once
+                the run settles with whichever listed nodes completed, running
+                `end_key` exactly once with the writes that arrived, instead of
+                discarding them when a listed node never runs.
 
         Raises:
             ValueError: If the start key is `'END'` or if the start key or end key is not present in the graph.
@@ -949,6 +958,11 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
             )
 
         if isinstance(start_key, str):
+            if inclusive:
+                raise ValueError(
+                    "inclusive requires a list of start nodes: a single-start "
+                    "edge has nothing to wait for"
+                )
             if start_key == END:
                 raise ValueError("END cannot be a start node")
             if end_key == START:
@@ -977,6 +991,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
             raise ValueError(f"Need to add_node `{end_key}` first")
 
         self.waiting_edges.add((tuple(start_key), end_key))
+        if inclusive:
+            self.inclusive_edges.add((tuple(start_key), end_key))
         return self
 
     def add_conditional_edges(
@@ -1392,7 +1408,9 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
             compiled.attach_edge(start, end)
 
         for starts, end in self.waiting_edges:
-            compiled.attach_edge(starts, end)
+            compiled.attach_edge(
+                starts, end, inclusive=(starts, end) in self.inclusive_edges
+            )
 
         for start, branches in self.branches.items():
             for name, branch in branches.items():
@@ -1548,7 +1566,9 @@ class CompiledStateGraph(
         else:
             raise RuntimeError
 
-    def attach_edge(self, starts: str | Sequence[str], end: str) -> None:
+    def attach_edge(
+        self, starts: str | Sequence[str], end: str, *, inclusive: bool = False
+    ) -> None:
         if isinstance(starts, str):
             # subscribe to start channel
             if end != END:
@@ -1559,9 +1579,19 @@ class CompiledStateGraph(
                 )
         elif end != END:
             channel_name = f"join:{'+'.join(starts)}:{end}"
+            if inclusive and self.builder.nodes[end].defer:
+                raise ValueError(
+                    f"add_edge inclusive=True is not supported together with "
+                    f"defer=True on '{end}': defer already postpones the node "
+                    f"to the end of the run"
+                )
             # register channel
             if self.builder.nodes[end].defer:
                 self.channels[channel_name] = NamedBarrierValueAfterFinish(
+                    str, set(starts)
+                )
+            elif inclusive:
+                self.channels[channel_name] = InclusiveNamedBarrierValue(
                     str, set(starts)
                 )
             else:

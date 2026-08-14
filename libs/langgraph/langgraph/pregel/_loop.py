@@ -72,6 +72,7 @@ from langgraph.callbacks import (
 from langgraph.channels.base import BaseChannel
 from langgraph.channels.binop import _get_overwrite
 from langgraph.channels.delta import DeltaChannel
+from langgraph.channels.named_barrier_value import InclusiveNamedBarrierValue
 from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.constants import TAG_HIDDEN
 from langgraph.errors import (
@@ -596,6 +597,74 @@ class PregelLoop:
     ) -> PregelExecutableTask | None:
         raise NotImplementedError
 
+    def _has_unreleased_inclusive_edge(self) -> bool:
+        return any(
+            isinstance(channel, InclusiveNamedBarrierValue)
+            and not channel.released
+            and channel.seen
+            and channel.seen != channel.names
+            for channel in self.channels.values()
+        )
+
+    def _release_inclusive_waiting_edges(self) -> bool:
+        """Release every inclusive waiting edge holding some of its names.
+
+        Called only when task derivation produced nothing, so no further write
+        can arrive and "the nodes that arrived" is final. The release is a flag
+        on the barrier; consume() clears it, so the edge re-arms as usual.
+        """
+        released = False
+        for name, channel in self.channels.items():
+            if not isinstance(channel, InclusiveNamedBarrierValue):
+                continue
+            if channel.release_arrived() is None:
+                continue
+            self.checkpoint["channel_versions"][name] = (
+                self.checkpointer_get_next_version(
+                    max(self.checkpoint["channel_versions"].values())
+                    if self.checkpoint["channel_versions"]
+                    else None,
+                    None,
+                )
+            )
+            if self.updated_channels is None:
+                self.updated_channels = set()
+            self.updated_channels.add(name)
+            released = True
+        return released
+
+    def _attach_waiting_edge_releases(self) -> None:
+        """Give tasks triggered by a released inclusive edge their record.
+
+        Derived from the channel each time tasks are prepared, so the record
+        survives an interrupt_before on the target and a resume from a
+        checkpoint written in between.
+        """
+        releases: dict[str, dict] | None = None
+        for name, channel in self.channels.items():
+            if not isinstance(channel, InclusiveNamedBarrierValue):
+                continue
+            if not channel.released:
+                continue
+            if releases is None:
+                releases = {}
+            target = name.rsplit(":", 1)[1]
+            entry = releases.setdefault(
+                target, {"target": target, "arrived": set(), "missing": set()}
+            )
+            entry["arrived"] |= channel.seen
+            entry["missing"] |= channel.names - channel.seen
+        if not releases:
+            return
+        for task in self.tasks.values():
+            release = releases.get(task.name)
+            if release is None:
+                continue
+            scratchpad = task.config[CONF].get(CONFIG_KEY_SCRATCHPAD)
+            if scratchpad is not None:
+                # frozen dataclass with slots; the field is declared
+                object.__setattr__(scratchpad, "waiting_edge_release", release)
+
     def tick(self) -> bool:
         """Execute a single iteration of the Pregel loop.
 
@@ -627,6 +696,7 @@ class PregelLoop:
             retry_policy=self.retry_policy,
             cache_policy=self.cache_policy,
         )
+        self._attach_waiting_edge_releases()
 
         # produce debug output
         if self._checkpointer_put_after_previous is not None:
@@ -651,8 +721,38 @@ class PregelLoop:
 
         # if no more tasks, we're done
         if not self.tasks:
-            self.status = "done"
-            return False
+            # The run has settled: the last superstep's writes are applied and
+            # task derivation produced nothing, so nothing is running and
+            # nothing is scheduled — a Send in flight would be a pending task.
+            # Inclusive waiting edges release here, with the nodes that
+            # arrived; a drain stops the run mid-flight, so it does not count.
+            if self.control is not None and self.control.drain_requested:
+                if self._has_unreleased_inclusive_edge():
+                    self.status = "draining"
+                    return False
+            elif self._release_inclusive_waiting_edges():
+                self.tasks = prepare_next_tasks(
+                    self.checkpoint,
+                    self.checkpoint_pending_writes,
+                    self.nodes,
+                    self.channels,
+                    self.managed,
+                    self.config,
+                    self.step,
+                    self.stop,
+                    for_execution=True,
+                    manager=self.manager,
+                    store=self.store,
+                    checkpointer=self.checkpointer,
+                    trigger_to_nodes=self.trigger_to_nodes,
+                    updated_channels=self.updated_channels,
+                    retry_policy=self.retry_policy,
+                    cache_policy=self.cache_policy,
+                )
+                self._attach_waiting_edge_releases()
+            if not self.tasks:
+                self.status = "done"
+                return False
 
         if self.control is not None and self.control.drain_requested:
             self.status = "draining"
