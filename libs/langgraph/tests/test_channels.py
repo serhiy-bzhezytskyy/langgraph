@@ -14,6 +14,10 @@ from langgraph._internal._typing import MISSING
 from langgraph.channels.binop import BinaryOperatorAggregate, _get_overwrite
 from langgraph.channels.delta import DeltaChannel
 from langgraph.channels.last_value import LastValue
+from langgraph.channels.named_barrier_value import (
+    NamedBarrierValue,
+    NamedBarrierValueAfterFinish,
+)
 from langgraph.channels.topic import Topic
 from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.errors import EmptyChannelError, InvalidUpdateError
@@ -796,3 +800,46 @@ def test_delta_channel_from_checkpoint_seed_none_is_distinct_from_sentinel() -> 
     ch = spec.from_checkpoint(None)
     ch.replay_writes([("t0", "x", "after")])
     assert ch.get() == "after"
+
+
+def test_named_barrier_value_from_checkpoint_after_finish_tuple() -> None:
+    """A barrier checkpointed with defer=True restores after the flag is removed."""
+    with_defer = NamedBarrierValueAfterFinish(str, {"a", "b"})
+    with_defer.update(["a"])
+
+    restored = NamedBarrierValue(str, {"a", "b"}).from_checkpoint(
+        with_defer.checkpoint()
+    )
+
+    assert restored.seen == {"a"}
+    restored.update(["b"])
+    assert restored.is_available()
+
+
+def test_named_barrier_value_after_finish_from_checkpoint_bare_set() -> None:
+    """A barrier checkpointed without defer restores after the flag is added."""
+    without_defer = NamedBarrierValue(str, {"a", "b"})
+    without_defer.update(["a"])
+
+    restored = NamedBarrierValueAfterFinish(str, {"a", "b"}).from_checkpoint(
+        without_defer.checkpoint()
+    )
+
+    assert restored.seen == {"a"}
+    assert restored.finished is False
+    restored.update(["b"])
+    assert restored.finish()
+    assert restored.is_available()
+
+
+def test_named_barrier_value_after_finish_from_checkpoint_two_seen() -> None:
+    """A bare set of exactly two names must not unpack into seen/finished."""
+    without_defer = NamedBarrierValue(str, {"a", "b", "c"})
+    without_defer.update(["a", "b"])
+
+    restored = NamedBarrierValueAfterFinish(str, {"a", "b", "c"}).from_checkpoint(
+        without_defer.checkpoint()
+    )
+
+    assert restored.seen == {"a", "b"}
+    assert restored.finished is False

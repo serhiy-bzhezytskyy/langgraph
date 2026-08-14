@@ -46,11 +46,13 @@ class NamedBarrierValue(Generic[Value], BaseChannel[Value, Value, set[Value]]):
     def checkpoint(self) -> set[Value]:
         return self.seen
 
-    def from_checkpoint(self, checkpoint: set[Value]) -> Self:
+    def from_checkpoint(self, checkpoint: set[Value] | tuple[set[Value], bool]) -> Self:
         empty = self.__class__(self.typ, self.names)
         empty.key = self.key
         if checkpoint is not MISSING:
-            empty.seen = checkpoint
+            # a thread checkpointed while the target had defer=True hands us
+            # the NamedBarrierValueAfterFinish (seen, finished) tuple
+            empty.seen = checkpoint[0] if isinstance(checkpoint, tuple) else checkpoint
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:
@@ -124,11 +126,16 @@ class NamedBarrierValueAfterFinish(
     def checkpoint(self) -> tuple[set[Value], bool]:
         return (self.seen, self.finished)
 
-    def from_checkpoint(self, checkpoint: tuple[set[Value], bool]) -> Self:
+    def from_checkpoint(self, checkpoint: tuple[set[Value], bool] | set[Value]) -> Self:
         empty = self.__class__(self.typ, self.names)
         empty.key = self.key
         if checkpoint is not MISSING:
-            empty.seen, empty.finished = checkpoint
+            if isinstance(checkpoint, tuple):
+                empty.seen, empty.finished = checkpoint
+            else:
+                # a thread checkpointed while the target had no defer hands us
+                # NamedBarrierValue's bare seen set
+                empty.seen = checkpoint
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:
