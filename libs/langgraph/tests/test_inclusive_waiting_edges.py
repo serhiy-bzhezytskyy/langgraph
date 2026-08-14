@@ -376,3 +376,27 @@ def test_toggling_from_inclusive_to_defer_is_safe() -> None:
 
     result = deferred.invoke({"ran": []}, config)
     assert _count(result["ran"], "gather") == 0
+
+
+def test_toggling_off_after_the_release_point_drops_the_release() -> None:
+    saver = InMemorySaver()
+
+    def build(inclusive: bool):
+        g = StateGraph(State)
+        g.add_node("w0", _mark("w0"))
+        g.add_node("w1", _mark("w1"))
+        g.add_node("gather", _mark("gather"))
+        g.add_conditional_edges(START, lambda s: "w1", ["w0", "w1"])
+        g.add_edge(["w0", "w1"], "gather", inclusive=inclusive)
+        g.add_edge("gather", END)
+        return g.compile(checkpointer=saver, interrupt_before=["gather"])
+
+    config = {"configurable": {"thread_id": "toggle-off-released"}}
+    paused = build(True).invoke({"ran": []}, config)
+    assert _count(paused["ran"], "gather") == 0
+
+    # the pause sits on a checkpoint where the edge has already released;
+    # resuming without the option follows the wait-for-all rule instead
+    downgraded = build(False)
+    result = downgraded.invoke(None, config)
+    assert _count(result["ran"], "gather") == 0
