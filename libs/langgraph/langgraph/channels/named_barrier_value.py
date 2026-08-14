@@ -54,7 +54,16 @@ class NamedBarrierValue(Generic[Value], BaseChannel[Value, Value, set[Value]]):
         empty = self.__class__(self.typ, self.names)
         empty.key = self.key
         if checkpoint is not MISSING:
-            empty.seen = checkpoint
+            # tolerate the (seen, released) pair checkpointed while the edge
+            # was inclusive, in case the option was toggled off
+            if (
+                isinstance(checkpoint, (tuple, list))
+                and len(checkpoint) == 2
+                and isinstance(checkpoint[1], bool)
+            ):
+                empty.seen = set(checkpoint[0])
+            else:
+                empty.seen = checkpoint
         return empty
 
     def update(self, values: Sequence[Value]) -> bool:

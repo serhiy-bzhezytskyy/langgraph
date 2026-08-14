@@ -300,3 +300,79 @@ async def test_ainvoke_releases_the_inclusive_edge() -> None:
     g.add_edge("c", END)
     out = await g.compile().ainvoke({"ran": []})
     assert out["ran"] == ["a", "c"]
+
+
+def test_toggling_the_option_off_on_an_existing_thread_is_safe() -> None:
+    saver = InMemorySaver()
+    boom = {"on": True}
+
+    def holder(state):
+        if boom["on"]:
+            boom["on"] = False
+            raise RuntimeError("boom")
+        return {"ran": ["holder"]}
+
+    def build(inclusive: bool):
+        g = StateGraph(State)
+        g.add_node("w0", _mark("w0"))
+        g.add_node("w1", _mark("w1"))
+        g.add_node("mid", _mark("mid"))
+        g.add_node("holder", holder)
+        g.add_node("gather", _mark("gather"))
+        g.add_conditional_edges(START, lambda s: ["w1", "mid"], ["w0", "w1", "mid"])
+        g.add_edge("mid", "holder")
+        g.add_edge(["w0", "w1"], "gather", inclusive=inclusive)
+        g.add_edge("gather", END)
+        g.add_edge("holder", END)
+        return g.compile(checkpointer=saver)
+
+    config = {"configurable": {"thread_id": "toggle-off"}}
+    with pytest.raises(RuntimeError, match="boom"):
+        build(True).invoke({"ran": []}, config)
+
+    downgraded = build(False)
+    result = downgraded.invoke(None, config)
+    assert _count(result["ran"], "holder") == 1
+    # the plain edge keeps the documented wait-for-all contract: w0 never ran
+    assert _count(result["ran"], "gather") == 0
+
+    # a second pass on the same thread writes to the barrier again
+    result = downgraded.invoke({"ran": []}, config)
+    assert _count(result["ran"], "gather") == 0
+
+
+def test_toggling_from_inclusive_to_defer_is_safe() -> None:
+    saver = InMemorySaver()
+    boom = {"on": True}
+
+    def holder(state):
+        if boom["on"]:
+            boom["on"] = False
+            raise RuntimeError("boom")
+        return {"ran": ["holder"]}
+
+    def build(inclusive: bool):
+        g = StateGraph(State)
+        g.add_node("w0", _mark("w0"))
+        g.add_node("w1", _mark("w1"))
+        g.add_node("mid", _mark("mid"))
+        g.add_node("holder", holder)
+        g.add_node("gather", _mark("gather"), defer=not inclusive)
+        g.add_conditional_edges(START, lambda s: ["w1", "mid"], ["w0", "w1", "mid"])
+        g.add_edge("mid", "holder")
+        g.add_edge(["w0", "w1"], "gather", inclusive=inclusive)
+        g.add_edge("gather", END)
+        g.add_edge("holder", END)
+        return g.compile(checkpointer=saver)
+
+    config = {"configurable": {"thread_id": "toggle-defer"}}
+    with pytest.raises(RuntimeError, match="boom"):
+        build(True).invoke({"ran": []}, config)
+
+    deferred = build(False)
+    result = deferred.invoke(None, config)
+    assert _count(result["ran"], "holder") == 1
+    assert _count(result["ran"], "gather") == 0
+
+    result = deferred.invoke({"ran": []}, config)
+    assert _count(result["ran"], "gather") == 0
